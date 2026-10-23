@@ -1,6 +1,6 @@
--- POLY LOOT DUNGEON SPEEDRUN V4 + 24H KEY GUI
+-- POLY LOOT DUNGEON SPEEDRUN V5 + 24H KEY GUI
 -- ============================================
--- POLY LOOT | DUNGEON SPEEDRUN V4
+-- POLY LOOT | DUNGEON SPEEDRUN V5 UNIVERSAL
 
 -- ============================================
 local Players = game:GetService("Players")
@@ -53,6 +53,11 @@ local ROOM_CONFIRM_TIMEOUT = 6
 local ROOM_RETRY_DELAY = 1.5
 local ROOM_TRANSITION_DELAY = 1.5
 local AUTO_ENTER_FIRST_ROOM = true
+
+-- Auto Replay is opt-in because each successful restart costs one
+-- Halloween Dungeon 2026 item. Selects available executor APIs automatically.
+local AUTO_REPLAY_DEFAULT = false
+local REPLAY_CONFIRM_TIMEOUT = 9
 local transitionUntil = 0
 local DEBUG_MODE = true
 
@@ -80,6 +85,9 @@ local waitingForRestart = false
 local completedRuns = 0
 local finalLootHandled = false
 local restartRoomObserved = false
+local autoReplayEnabled = AUTO_REPLAY_DEFAULT
+local replayAttempted = false
+local replayAttemptAt = 0
 local attackCount = 0
 local defeatedCount = 0
 local skippedEnemies = {}
@@ -175,7 +183,7 @@ gui.Name = "PolyLootDungeonV4"
 gui.ResetOnSpawn = false
 gui.Parent = playerGui
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(300, 335)
+frame.Size = UDim2.fromOffset(300, 380)
 frame.Position = UDim2.new(0.5, -150, 0.2, 0)
 frame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
 frame.BorderSizePixel = 0
@@ -198,10 +206,11 @@ local function makeLabel(text, y)
     return label
 end
 local title = makeLabel(
-    "POLY LOOT | DUNGEON SPEEDRUN V4", 10
+    "POLY LOOT | DUNGEON SPEEDRUN V5 UNIVERSAL", 10
 )
 title.Font = Enum.Font.GothamBold
 title.TextColor3 = Color3.new(1, 1, 1)
+title.TextSize = 11
 local button = Instance.new("TextButton")
 button.Size = UDim2.new(1, -30, 0, 43)
 button.Position = UDim2.fromOffset(15, 43)
@@ -358,6 +367,35 @@ licenseButton.Font = Enum.Font.Gotham
 licenseButton.TextSize = 12
 licenseButton.Text = "License: not activated"
 licenseButton.Parent = frame
+
+-- Optional Auto Replay toggle in the main GUI.
+local autoReplayButton = Instance.new("TextButton")
+autoReplayButton.Name = "AutoReplayToggle"
+autoReplayButton.Size = UDim2.new(1, -30, 0, 32)
+autoReplayButton.Position = UDim2.fromOffset(15, 338)
+autoReplayButton.BackgroundColor3 = Color3.fromRGB(55, 58, 75)
+autoReplayButton.BorderSizePixel = 0
+autoReplayButton.TextColor3 = Color3.fromRGB(240, 240, 250)
+autoReplayButton.Font = Enum.Font.GothamBold
+autoReplayButton.TextSize = 13
+autoReplayButton.Parent = frame
+Instance.new("UICorner", autoReplayButton).CornerRadius = UDim.new(0, 8)
+
+local function updateAutoReplayButton()
+    autoReplayButton.Text = autoReplayEnabled
+        and "AUTO REPLAY: ON (uses 1 dungeon item)"
+        or "AUTO REPLAY: OFF (manual)"
+    autoReplayButton.BackgroundColor3 = autoReplayEnabled
+        and Color3.fromRGB(40, 110, 85)
+        or Color3.fromRGB(55, 58, 75)
+end
+
+updateAutoReplayButton()
+autoReplayButton.MouseButton1Click:Connect(function()
+    autoReplayEnabled = not autoReplayEnabled
+    updateAutoReplayButton()
+    debugPrint("Auto Replay:", autoReplayEnabled and "ON" or "OFF")
+end)
 
 -- Hauptoberflaeche vor erfolgreicher Key-Pruefung unsichtbar.
 frame.Visible = false
@@ -1265,6 +1303,8 @@ local function resetDungeonRun(roomAlreadyDetected)
     waitingForRestart = false
     finalLootHandled = false
     restartRoomObserved = false
+    replayAttempted = false
+    replayAttemptAt = 0
     skippedEnemies = {}
     usedDoors = {}
     lastRoomAttempt = 0
@@ -1344,6 +1384,9 @@ local function collectDroppedItems(id)
     local started = os.clock()
     local attempted = {}
     local collected = 0
+    -- Keep the search centered on the original room, even after teleporting.
+    local originRoot = getRoot()
+    local lootOrigin = originRoot and originRoot.Position or nil
     while validSession(id)
         and os.clock() - started < LOOT_TIMEOUT do
         local drops = getNearbyDrops(lootOrigin)
@@ -1458,8 +1501,315 @@ local function collectDroppedItems(id)
     return true
 end
 
+-- ============================================
+-- UNIVERSAL AUTO REPLAY | EXECUTOR CAPABILITIES
+-- ============================================
+-- Detect the executor for diagnostics, but choose APIs by capability.
+-- Executor names and APIs change between releases.
+local function getExecutorInfo()
+    local probes = {}
+    if type(identifyexecutor) == "function" then
+        table.insert(probes, identifyexecutor)
+    end
+    if type(getexecutorname) == "function" then
+        table.insert(probes, getexecutorname)
+    end
+    for _, probe in ipairs(probes) do
+        local ok, name, version = pcall(probe)
+        if ok and type(name) == "string" and #name > 0 then
+            return name, type(version) == "string" and version or ""
+        end
+    end
+    return "Unknown", ""
+end
+
+local executorName, executorVersion = getExecutorInfo()
+local executorNameLower = string.lower(executorName)
+local function canUseNativeMouse()
+    return type(mousemoveabs) == "function" and (
+        type(mouse1click) == "function" or
+        (type(mouse1press) == "function" and type(mouse1release) == "function")
+    )
+end
+
+local function getNativeMouseFocus()
+    local focusFn = nil
+    if type(isrbxactive) == "function" then
+        focusFn = isrbxactive
+    elseif type(isgameactive) == "function" then
+        focusFn = isgameactive
+    elseif type(iswindowactive) == "function" then
+        focusFn = iswindowactive
+    end
+    if focusFn then
+        local ok, isActive = pcall(focusFn)
+        if ok and isActive == false then
+            return false
+        end
+    end
+    return true
+end
+
+local function getReplayButton()
+    local hud = playerGui:FindFirstChild("DungeonHud")
+    local result = hud and hud:FindFirstChild("Result")
+    local again = result and result:FindFirstChild("Again")
+    if not again or not again:IsA("GuiButton") then
+        return nil, "Run again button was not found"
+    end
+    if not again.Visible or not again.Active or not again.Interactable then
+        return nil, "Run again button is not clickable"
+    end
+    return again, nil
+end
+
+local function replayButtonCenter(again)
+    local pos = again.AbsolutePosition
+    local size = again.AbsoluteSize
+    if size.X <= 0 or size.Y <= 0 then
+        return nil, nil, "Run again button is not on-screen"
+    end
+    local x = math.floor(pos.X + size.X / 2)
+    local y = math.floor(pos.Y + size.Y / 2)
+    local camera = workspace.CurrentCamera
+    if camera then
+        local viewport = camera.ViewportSize
+        if x < 0 or y < 0 or x >= viewport.X or y >= viewport.Y then
+            return nil, nil, "Run again button is outside the viewport"
+        end
+    end
+    return x, y, nil
+end
+
+-- A real mouse click is preferable when possible: it follows the game's
+-- normal input path. Our own GUI is hidden briefly to avoid blocking it.
+local function tryNativeMouseReplay(id, again)
+    if not canUseNativeMouse() then
+        return false, "Native mouse API not available"
+    end
+    if not getNativeMouseFocus() then
+        return false, "Roblox is not the focused window"
+    end
+    local x, y, positionError = replayButtonCenter(again)
+    if not x then
+        return false, positionError
+    end
+
+    local alreadyPressed = false
+    local inputStarted = false
+    local wasVisible = frame.Visible
+    local ok, err = pcall(function()
+        -- Prevent the Speedrun GUI from covering the result's button.
+        frame.Visible = false
+        task.wait(0.12)
+        if not validSession(id) or not isDungeonComplete() or not again.Visible then
+            error("Result screen changed before clicking")
+        end
+        mousemoveabs(x, y)
+        task.wait(0.12)
+        if not validSession(id) or not isDungeonComplete() then
+            error("Result screen disappeared before clicking")
+        end
+        if type(mouse1press) == "function" and type(mouse1release) == "function" then
+            mouse1press()
+            inputStarted = true
+            alreadyPressed = true
+            task.wait(0.075)
+            mouse1release()
+            alreadyPressed = false
+        else
+            -- mouse1click is supported by some executors without press/release.
+            inputStarted = true
+            mouse1click()
+        end
+        task.wait(0.15)
+    end)
+    if alreadyPressed then
+        pcall(mouse1release)
+    end
+    frame.Visible = wasVisible and gui.Parent ~= nil
+    if not ok then
+        -- A partially delivered mouse press is uncertain. Do not try a second
+        -- method automatically; it could trigger another paid dungeon run.
+        if inputStarted then
+            return true, "Mouse input may have been sent: " .. tostring(err)
+        end
+        return false, "Native mouse failed: " .. tostring(err)
+    end
+    return true, string.format("Native mouse click at %d, %d", x, y)
+end
+
+-- Direct signal activation for executors supporting firesignal.
+-- This does not guarantee that game logic will accept a missing InputObject.
+local function chooseReplaySignal(again)
+    if type(getconnections) == "function" then
+        local okA, activated = pcall(getconnections, again.Activated)
+        local okM, clicked = pcall(getconnections, again.MouseButton1Click)
+        if okA and type(activated) == "table" and #activated > 0 then
+            return again.Activated, "Activated", activated
+        end
+        if okM and type(clicked) == "table" and #clicked > 0 then
+            return again.MouseButton1Click, "MouseButton1Click", clicked
+        end
+    end
+    return again.Activated, "Activated", nil
+end
+
+local function tryFireSignalReplay(_, again)
+    if type(firesignal) ~= "function" then
+        return false, "firesignal API not available"
+    end
+    local signal, eventName = chooseReplaySignal(again)
+    local ok, err = pcall(function()
+        if eventName == "Activated" then
+            firesignal(signal, nil, 0)
+        else
+            firesignal(signal)
+        end
+    end)
+    if not ok then
+        -- It is impossible to know whether any listener ran before the error.
+        return true, "Signal dispatch may have partially succeeded: " .. tostring(err)
+    end
+    return true, "firesignal(" .. eventName .. ") dispatched"
+end
+
+-- Some executors have getconnections but no firesignal.
+local function tryConnectionsReplay(_, again)
+    if type(getconnections) ~= "function" then
+        return false, "getconnections API not available"
+    end
+    local _, eventName, list = chooseReplaySignal(again)
+    if type(list) ~= "table" or #list == 0 then
+        return false, "No accessible button event connections"
+    end
+    local count = 0
+    for _, conn in ipairs(list) do
+        if conn.Enabled ~= false then
+            local ok = pcall(function()
+                if type(conn.Fire) == "function" then
+                    if eventName == "Activated" then
+                        conn:Fire(nil, 0)
+                    else
+                        conn:Fire()
+                    end
+                elseif type(conn.Function) == "function" then
+                    if eventName == "Activated" then
+                        conn.Function(nil, 0)
+                    else
+                        conn.Function()
+                    end
+                else
+                    error("Unusable connection")
+                end
+            end)
+            if ok then count = count + 1 end
+        end
+    end
+    if count == 0 then
+        return false, "Button connections could not be executed"
+    end
+    return true, "Fired " .. count .. " " .. eventName .. " connection(s)"
+end
+
+-- Last-resort API for runtimes which expose VirtualInputManager only.
+-- This previously failed in some executors, so it is NOT the first choice.
+local function tryVirtualInputReplay(id, again)
+    local x, y, err = replayButtonCenter(again)
+    if not x then return false, err end
+    local okService, vim = pcall(function()
+        return game:GetService("VirtualInputManager")
+    end)
+    if not okService or not vim then
+        return false, "VirtualInputManager is unavailable"
+    end
+    local wasVisible = frame.Visible
+    local inputStarted = false
+    local ok, failure = pcall(function()
+        frame.Visible = false
+        task.wait(0.1)
+        if not validSession(id) or not isDungeonComplete() then
+            error("Result screen changed before clicking")
+        end
+        vim:SendMouseMoveEvent(x, y, game)
+        task.wait(0.09)
+        inputStarted = true
+        vim:SendMouseButtonEvent(x, y, 0, true, game, 0)
+        task.wait(0.09)
+        vim:SendMouseButtonEvent(x, y, 0, false, game, 0)
+        task.wait(0.1)
+    end)
+    frame.Visible = wasVisible and gui.Parent ~= nil
+    if not ok then
+        if inputStarted then
+            return true, "VirtualInputManager may have sent input: " .. tostring(failure)
+        end
+        return false, "VirtualInputManager failed: " .. tostring(failure)
+    end
+    return true, "VirtualInputManager click dispatched"
+end
+
+local function replayMethodOrder()
+    -- Name-based preference is only a hint; functionality is checked at call.
+    -- Solara: native cursor. Potassium: native cursor or signal fallback.
+    -- Unknown executor: detect and use whichever API is available.
+    if executorNameLower:find("potassium", 1, true) then
+        return { "native", "signal", "connections", "virtual" }
+    elseif executorNameLower:find("solara", 1, true) then
+        return { "native", "virtual", "signal", "connections" }
+    end
+    return { "native", "signal", "connections", "virtual" }
+end
+
+local replayMethods = {
+    native = tryNativeMouseReplay,
+    signal = tryFireSignalReplay,
+    connections = tryConnectionsReplay,
+    virtual = tryVirtualInputReplay,
+}
+
+local function printReplayCapabilities()
+    local versionText = executorVersion ~= "" and (" " .. executorVersion) or ""
+    debugPrint("Executor detected:", executorName .. versionText)
+    debugPrint("Replay API:",
+        "nativeMouse=" .. tostring(canUseNativeMouse()),
+        "firesignal=" .. tostring(type(firesignal) == "function"),
+        "getconnections=" .. tostring(type(getconnections) == "function"))
+    debugPrint("Replay preference:", table.concat(replayMethodOrder(), " -> "))
+end
+printReplayCapabilities()
+
+-- One actual activation attempt per endscreen. If an API call errors BEFORE
+-- dispatching input, the next supported method is tried automatically.
+-- If input might have been sent, we wait for the game or require manual replay.
+local function attemptAutoReplay(id)
+    if not validSession(id) or not isDungeonComplete() then
+        return false, "Endscreen not ready"
+    end
+    if accessGui.Enabled then
+        return false, "Close the key window before replay"
+    end
+    local again, buttonError = getReplayButton()
+    if not again then
+        return false, buttonError
+    end
+    local failures = {}
+    for _, method in ipairs(replayMethodOrder()) do
+        if not validSession(id) or not isDungeonComplete() then
+            return false, "Endscreen changed while choosing replay method"
+        end
+        local success, sent, reason = pcall(replayMethods[method], id, again)
+        if success and sent then
+            debugPrint("Auto Replay method:", method, reason)
+            return true, method .. ": " .. tostring(reason)
+        end
+        table.insert(failures, method .. "=" .. tostring(success and reason or sent))
+    end
+    return false, "No usable method: " .. table.concat(failures, "; ")
+end
+
 local function startSpeedrun(id)
-    debugPrint("Dungeon Speedrun gestartet!")
+    debugPrint("Dungeon Speedrun started!")
     while validSession(id) do
         if isDungeonComplete() then
             if not waitingForRestart then
@@ -1467,17 +1817,37 @@ local function startSpeedrun(id)
                 restartRoomObserved = false
                 stopMovement()
                 clearTarget()
-                statusLabel.Text = "Dungeon cleared - click Run again"
+                replayAttempted = false
+                replayAttemptAt = 0
+                statusLabel.Text = "Dungeon cleared - waiting for restart"
                 button.Text = "WAITING FOR RESTART"
-                debugPrint("Dungeon abgeschlossen; warte auf manuellen Restart")
+                debugPrint("Dungeon cleared; waiting for restart")
             end
-            -- Auch nach dem letzten Boss die Boden-Drops beachten.
+            -- Collect any final boss drops before requesting another run.
             if not finalLootHandled then
                 finalLootHandled = true
                 collectDroppedItems(id)
             end
-            -- Der Endscreen bleibt offen bis zur manuellen Eingabe.
+            -- Start replay automatically only if the user enabled it.
+            -- Try at most ONCE per endscreen, even if the server rejects it.
             while validSession(id) and isDungeonComplete() do
+                if autoReplayEnabled and not replayAttempted then
+                    replayAttempted = true
+                    replayAttemptAt = os.clock()
+                    local sent, reason = attemptAutoReplay(id)
+                    debugPrint("Auto Replay attempt:", sent, reason)
+                    if sent then
+                        statusLabel.Text = "Auto Replay sent - checking restart..."
+                    else
+                        statusLabel.Text = "Auto Replay failed - click Run again"
+                    end
+                end
+                if replayAttempted and replayAttemptAt > 0
+                    and os.clock() - replayAttemptAt >= REPLAY_CONFIRM_TIMEOUT then
+                    statusLabel.Text = "Replay not confirmed - click Run again"
+                    -- Disable repeated timeout messages, not the manual option.
+                    replayAttemptAt = 0
+                end
                 task.wait(0.2)
             end
             if not validSession(id) then break end
@@ -1559,6 +1929,8 @@ button.MouseButton1Click:Connect(function()
     if running then
         dungeonComplete = false
         waitingForRestart = false
+        replayAttempted = false
+        replayAttemptAt = 0
         skippedEnemies = {}
         usedDoors = {}
         lastRoomAttempt = 0
@@ -1573,4 +1945,4 @@ button.MouseButton1Click:Connect(function()
         clearTarget()
     end
 end)
-print("Poly Loot Dungeon Speedrun V4 + 24h Key GUI geladen!")
+print("Poly Loot Dungeon Speedrun V5 Universal + 24h Key GUI loaded!")
