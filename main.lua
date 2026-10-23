@@ -28,7 +28,12 @@ local accessBusy = false
 -- EINSTELLUNGEN
 
 -- ============================================
-local WEAPON_NAME = "Halloween Greatsword"
+-- Equipped combat tool is detected automatically.
+-- Add utility/non-combat Tool names here to avoid using them as weapons.
+local NON_WEAPON_TOOLS = {
+    ["halloween dungeon 2026"] = true,
+    ["ghostnet"] = true,
+}
 -- Kampf
 local ATTACK_DISTANCE = 2
 local ATTACK_INTERVAL = 0.65
@@ -119,11 +124,22 @@ local function getWeapon()
     if not character then
         return nil
     end
-    local tool = character:FindFirstChild(WEAPON_NAME)
-    if tool and tool:IsA("Tool") then
-        return tool
+
+    -- Equipped Roblox Tools are parented to the player's Character.
+    -- Backpack items are intentionally ignored until equipped.
+    local fallback = nil
+    for _, tool in ipairs(character:GetChildren()) do
+        if tool:IsA("Tool") and not NON_WEAPON_TOOLS[tool.Name:lower()] then
+            -- Prefer items carrying the game's weapon attributes when available.
+            if tool:GetAttribute("WeaponId") ~= nil
+                or tool:GetAttribute("WeaponRank") ~= nil
+                or tool:GetAttribute("_HitboxReach") ~= nil then
+                return tool
+            end
+            fallback = fallback or tool
+        end
     end
-    return nil
+    return fallback
 end
 
 local function validSession(id)
@@ -1485,7 +1501,7 @@ local function startSpeedrun(id)
         local weapon = getWeapon()
         local humanoid = getHumanoid()
         if not weapon then
-            statusLabel.Text = "Equip Halloween Greatsword"
+            statusLabel.Text = "Equip a weapon"
             task.wait(0.4)
         elseif not humanoid or humanoid.Health <= 0 then
             statusLabel.Text = "Character not ready"
