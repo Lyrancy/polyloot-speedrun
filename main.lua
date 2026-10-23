@@ -1,6 +1,6 @@
 -- POLY LOOT DUNGEON SPEEDRUN V5 + 24H KEY GUI
 -- ============================================
--- POLY LOOT | DUNGEON SPEEDRUN V5 UNIVERSAL
+-- POLY LOOT | DUNGEON SPEEDRUN V5 UNIVERSAL + ANTI-AFK
 
 -- ============================================
 local Players = game:GetService("Players")
@@ -57,6 +57,9 @@ local AUTO_ENTER_FIRST_ROOM = true
 -- Auto Replay is opt-in because each successful restart costs one
 -- Halloween Dungeon 2026 item. Selects available executor APIs automatically.
 local AUTO_REPLAY_DEFAULT = false
+-- Anti-AFK is enabled by default, but only sends activity while the
+-- licensed Speedrun is running. It can be toggled independently in the GUI.
+local ANTI_AFK_DEFAULT = true
 local REPLAY_CONFIRM_TIMEOUT = 9
 local transitionUntil = 0
 local DEBUG_MODE = true
@@ -86,6 +89,7 @@ local completedRuns = 0
 local finalLootHandled = false
 local restartRoomObserved = false
 local autoReplayEnabled = AUTO_REPLAY_DEFAULT
+local antiAfkEnabled = ANTI_AFK_DEFAULT
 local replayAttempted = false
 local replayAttemptAt = 0
 local attackCount = 0
@@ -183,7 +187,7 @@ gui.Name = "PolyLootDungeonV4"
 gui.ResetOnSpawn = false
 gui.Parent = playerGui
 local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(300, 380)
+frame.Size = UDim2.fromOffset(300, 424)
 frame.Position = UDim2.new(0.5, -150, 0.2, 0)
 frame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
 frame.BorderSizePixel = 0
@@ -206,7 +210,7 @@ local function makeLabel(text, y)
     return label
 end
 local title = makeLabel(
-    "POLY LOOT | DUNGEON SPEEDRUN V5 UNIVERSAL", 10
+    "POLY LOOT | DUNGEON SPEEDRUN", 10
 )
 title.Font = Enum.Font.GothamBold
 title.TextColor3 = Color3.new(1, 1, 1)
@@ -395,6 +399,32 @@ autoReplayButton.MouseButton1Click:Connect(function()
     autoReplayEnabled = not autoReplayEnabled
     updateAutoReplayButton()
     debugPrint("Auto Replay:", autoReplayEnabled and "ON" or "OFF")
+end)
+
+-- Optional Anti-AFK toggle in the main GUI (enabled by default).
+local antiAfkButton = Instance.new("TextButton")
+antiAfkButton.Name = "AntiAfkToggle"
+antiAfkButton.Size = UDim2.new(1, -30, 0, 32)
+antiAfkButton.Position = UDim2.fromOffset(15, 380)
+antiAfkButton.BorderSizePixel = 0
+antiAfkButton.TextColor3 = Color3.fromRGB(240, 240, 250)
+antiAfkButton.Font = Enum.Font.GothamBold
+antiAfkButton.TextSize = 13
+antiAfkButton.Parent = frame
+Instance.new("UICorner", antiAfkButton).CornerRadius = UDim.new(0, 8)
+
+local function updateAntiAfkButton()
+    antiAfkButton.Text = antiAfkEnabled and "ANTI-AFK: ON" or "ANTI-AFK: OFF"
+    antiAfkButton.BackgroundColor3 = antiAfkEnabled
+        and Color3.fromRGB(40, 110, 85)
+        or Color3.fromRGB(55, 58, 75)
+end
+
+updateAntiAfkButton()
+antiAfkButton.MouseButton1Click:Connect(function()
+    antiAfkEnabled = not antiAfkEnabled
+    updateAntiAfkButton()
+    debugPrint("Anti-AFK:", antiAfkEnabled and "ON" or "OFF")
 end)
 
 -- Hauptoberflaeche vor erfolgreicher Key-Pruefung unsichtbar.
@@ -634,6 +664,117 @@ task.spawn(function()
             end
         end
         task.wait(1)
+    end
+end)
+
+-- ============================================
+-- UNIVERSAL ANTI-AFK | IDLE EVENT + SAFE FALLBACKS
+-- ============================================
+-- Fired by Roblox after a period without real player input.
+-- No mouse clicks are used: they could accidentally click "Run again".
+-- Executor capabilities vary; successful delivery is not a guarantee
+-- that Roblox will reset the inactivity timer in every environment.
+local antiAfkConnection = nil
+local antiAfkWarningShown = false
+
+local function sendAntiAfkActivity()
+    -- Most executor environments expose VirtualUser. Prefer its right-click
+    -- simulation since it does not require foreground mouse coordinates.
+    local virtualUserOk, virtualUser = pcall(function()
+        return game:GetService("VirtualUser")
+    end)
+    if virtualUserOk and virtualUser then
+        local ok = pcall(function()
+            virtualUser:CaptureController()
+            virtualUser:ClickButton2(Vector2.new(0, 0))
+        end)
+        if ok then
+            return true, "VirtualUser"
+        end
+    end
+
+    -- Some executors expose VirtualInputManager instead.
+    -- F15 should not activate normal in-game buttons or cause movement.
+    local vimOk, vim = pcall(function()
+        return game:GetService("VirtualInputManager")
+    end)
+    if vimOk and vim then
+        local ok = pcall(function()
+            vim:SendKeyEvent(true, Enum.KeyCode.F15, false, game)
+            task.wait(0.05)
+            vim:SendKeyEvent(false, Enum.KeyCode.F15, false, game)
+        end)
+        if ok then
+            return true, "VirtualInputManager"
+        end
+    end
+
+    -- Final fallback: executor-specific keyboard APIs. Only attempt
+    -- when Roblox is focused; never generate a real desktop key into
+    -- the browser, another app, or a chat text field.
+    if type(keypress) == "function" and type(keyrelease) == "function" then
+        local gameIsFocused = true
+        if type(isrbxactive) == "function" then
+            local ok, active = pcall(isrbxactive)
+            gameIsFocused = ok and active == true
+        elseif type(isgameactive) == "function" then
+            local ok, active = pcall(isgameactive)
+            gameIsFocused = ok and active == true
+        else
+            -- Unknown focus: do not synthesize desktop input.
+            gameIsFocused = false
+        end
+
+        local textBoxFocused = false
+        local inputOk, inputService = pcall(function()
+            return game:GetService("UserInputService")
+        end)
+        if inputOk and inputService then
+            local ok, focused = pcall(function()
+                return inputService:GetFocusedTextBox()
+            end)
+            textBoxFocused = not ok or focused ~= nil
+        end
+
+        if gameIsFocused and not textBoxFocused then
+            local ok = pcall(function()
+                keypress(0x7E) -- F15
+                task.wait(0.05)
+                keyrelease(0x7E)
+            end)
+            if ok then
+                return true, "Executor F15"
+            end
+            -- Release best-effort even after an unexpected error.
+            pcall(keyrelease, 0x7E)
+        end
+    end
+
+    return false, "No supported Anti-AFK input method"
+end
+
+antiAfkConnection = player.Idled:Connect(function()
+    -- When a new script execution replaces this GUI, remove this old listener.
+    if not gui.Parent then
+        if antiAfkConnection then
+            antiAfkConnection:Disconnect()
+            antiAfkConnection = nil
+        end
+        return
+    end
+
+    if not antiAfkEnabled or not running
+        or not accessGranted or os.clock() >= accessDeadline then
+        return
+    end
+
+    local ok, method = sendAntiAfkActivity()
+    if ok then
+        debugPrint("Anti-AFK activity sent via", method)
+        antiAfkWarningShown = false
+    elseif not antiAfkWarningShown then
+        warn("[DUNGEON V5] Anti-AFK unavailable: " .. tostring(method))
+        antiAfkWarningShown = true
     end
 end)
 
