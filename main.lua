@@ -1,4 +1,4 @@
--- POLY LOOT DUNGEON SPEEDRUN V5 + 24H KEY GUI
+-- POLY LOOT DUNGEON SPEEDRUN V5 + OASIS UI + 24H KEY
 -- ============================================
 -- POLY LOOT | DUNGEON SPEEDRUN V5 UNIVERSAL + ANTI-AFK
 
@@ -173,86 +173,244 @@ local function horizontalDistance(a, b)
 end
 
 -- ============================================
--- GUI
-
+-- OASIS UI | DUNGEON SELECTION HUB
 -- ============================================
-local oldGui = playerGui:FindFirstChild(
-    "PolyLootDungeonV4"
-)
-if oldGui then
-    oldGui:Destroy()
-end
+-- OasisUI's demo features are NOT loaded. Only the controls below exist.
+-- Keep the original 24H Key window as a separate login gate.
+local oldGui = playerGui:FindFirstChild("PolyLootDungeonV4")
+if oldGui then oldGui:Destroy() end
+
+-- A lightweight lifecycle parent retained for the existing dungeon logic,
+-- and for target Highlights that were parented to the old ScreenGui.
 local gui = Instance.new("ScreenGui")
 gui.Name = "PolyLootDungeonV4"
 gui.ResetOnSpawn = false
 gui.Parent = playerGui
-local frame = Instance.new("Frame")
-frame.Size = UDim2.fromOffset(300, 424)
-frame.Position = UDim2.new(0.5, -150, 0.2, 0)
-frame.BackgroundColor3 = Color3.fromRGB(25, 25, 35)
-frame.BorderSizePixel = 0
-frame.Active = true
-frame.Draggable = true
-frame.Parent = gui
-Instance.new("UICorner", frame).CornerRadius =
-    UDim.new(0, 12)
 
-local function makeLabel(text, y)
-    local label = Instance.new("TextLabel")
-    label.Size = UDim2.new(1, -20, 0, 25)
-    label.Position = UDim2.fromOffset(10, y)
-    label.BackgroundTransparency = 1
-    label.TextColor3 = Color3.fromRGB(200, 200, 215)
-    label.TextSize = 13
-    label.Font = Enum.Font.Gotham
-    label.Text = text
-    label.Parent = frame
-    return label
+local OasisUI = loadstring(game:HttpGet(
+    "https://github.com/Mold53/OasisUI/releases/download/v1.6.0/OasisUI.lua"
+))()
+
+local Window = OasisUI:CreateWindow({
+    Title = "POLY LOOT",
+    Subtitle = "Dungeon Speedrun V5",
+    Folder = "PolyLootSpeedrun",
+    GuiName = "PolyLootOasisV5",
+    Icon = "swords",
+    Theme = "Midnight",
+    ToggleKey = Enum.KeyCode.RightShift,
+    Settings = false,          -- Hide built-in settings/config editor
+    Search = false,            -- Hide the search bar
+    SearchShortcut = false,
+    User = false,              -- Hide the user profile card
+    AutoLoad = false,          -- Do not restore a saved Speedrun ON state
+    AutoSave = false,
+    CloseAction = "Hide",
+})
+Window:SetVisible(false)     -- Key must be verified first
+
+-- Legacy "frame.Visible" reads/writes are mapped to the Oasis window.
+-- This also keeps the Auto Replay mouse-blocking workaround intact.
+local oasisVisible = false
+local frame = setmetatable({}, {
+    __index = function(_, key)
+        if key == "Visible" then return oasisVisible end
+    end,
+    __newindex = function(_, key, value)
+        if key == "Visible" then
+            oasisVisible = value == true
+            Window:SetVisible(oasisVisible)
+        end
+    end,
+})
+
+-- Make Oasis labels respond to the existing statusLabel.Text assignments.
+-- This lets the combat/navigation logic stay untouched.
+local function textProxy(element)
+    local current = ""
+    return setmetatable({}, {
+        __index = function(_, key)
+            if key == "Text" then return current end
+        end,
+        __newindex = function(_, key, value)
+            if key == "Text" then
+                current = tostring(value)
+                element:SetValue(current:match("^[^:]+:%s*(.*)$") or current)
+            end
+        end,
+    })
 end
-local title = makeLabel(
-    "POLY LOOT | DUNGEON SPEEDRUN", 10
-)
-title.Font = Enum.Font.GothamBold
-title.TextColor3 = Color3.new(1, 1, 1)
-title.TextSize = 11
-local button = Instance.new("TextButton")
-button.Size = UDim2.new(1, -30, 0, 43)
-button.Position = UDim2.fromOffset(15, 43)
-button.BackgroundColor3 = Color3.fromRGB(175, 55, 65)
-button.BorderSizePixel = 0
-button.Text = "SPEEDRUN: OFF"
-button.TextColor3 = Color3.new(1, 1, 1)
-button.TextSize = 16
-button.Font = Enum.Font.GothamBold
-button.Parent = frame
-Instance.new("UICorner", button).CornerRadius =
-    UDim.new(0, 8)
-local roomLabel = makeLabel("Room: - / 18", 98)
-local waveLabel = makeLabel("Wave: -", 125)
-local targetLabel = makeLabel("Target: -", 152)
-local healthLabel = makeLabel("HP: -", 179)
-local killLabel = makeLabel("Enemies defeated: 0", 206)
-local attackLabel = makeLabel("Attacks: 0", 233)
-local statusLabel = makeLabel("Status: Ready", 265)
-statusLabel.TextColor3 =
-    Color3.fromRGB(100, 200, 255)
 
--- ============================================
--- GUI STATUS
+-- Dungeon hub architecture: selecting a dungeon reveals only its own controls.
+-- To add another dungeon later, register it below and implement its engine.
+local DUNGEON_ORDER = { "halloween" }
+local DUNGEONS = {
+    halloween = {
+        Title = "Halloween Dungeon",
+        Description = "Halloween Dungeon 2026 | 18 rooms and bosses",
+        Icon = "skull",
+    },
+}
 
--- ============================================
+local selectedDungeonId = nil
+local onSpeedrunToggle = nil   -- Implemented after the dungeon loop
+local syncingSpeedrun = false
 
-local function setButton(enabled)
-    if enabled then
-        button.Text = "SPEEDRUN: ON"
-        button.BackgroundColor3 =
-            Color3.fromRGB(45, 160, 100)
-    else
-        button.Text = "SPEEDRUN: OFF"
-        button.BackgroundColor3 =
-            Color3.fromRGB(175, 55, 65)
+local dungeonTab = Window:Tab({ Title = "Dungeon", Icon = "swords", Columns = 1 })
+local statusTab = Window:Tab({ Title = "Status", Icon = "activity", Columns = 1 })
+
+-- Only registered dungeons appear in the selector. No fake or placeholder modes.
+local dungeonValues = {}
+for _, dungeonId in ipairs(DUNGEON_ORDER) do
+    local definition = DUNGEONS[dungeonId]
+    table.insert(dungeonValues, {
+        Title = definition.Title,
+        Value = dungeonId,
+        Description = definition.Description,
+        Icon = definition.Icon,
+    })
+end
+
+local selectorSection = dungeonTab:Section({ Title = "Dungeon Selection", Icon = "list" })
+local selectorInfo = selectorSection:Paragraph({
+    Title = "Select a Dungeon",
+    Content = "Choose a dungeon to display its available farming functions.",
+    Icon = "info",
+})
+local onDungeonSelected = nil
+local dungeonSelector = selectorSection:Dropdown({
+    Title = "Dungeon",
+    Values = dungeonValues,
+    Default = nil,
+    Multi = false,
+    AllowNone = true,
+    Search = false,
+    Placeholder = "Choose a dungeon...",
+    Callback = function(value)
+        if onDungeonSelected then
+            onDungeonSelected(value)
+        end
+    end,
+})
+
+-- Halloween-specific features: displayed only while Halloween is selected.
+local speedrunModule = dungeonTab:Module({
+    Title = "Dungeon Speedrun",
+    Description = "Automatically enter, fight, and clear the 18 Halloween rooms.",
+    Icon = "swords",
+    Keybind = false,
+    Default = false,
+    Callback = function(enabled)
+        if not syncingSpeedrun and onSpeedrunToggle then
+            onSpeedrunToggle(enabled)
+        end
+    end,
+})
+
+local autoReplayModule = dungeonTab:Module({
+    Title = "Auto Replay",
+    Description = "Attempt to restart after clearing the dungeon. Uses one dungeon item per successful replay.",
+    Icon = "rotate-cw",
+    Keybind = false,
+    Default = AUTO_REPLAY_DEFAULT,
+    Callback = function(enabled)
+        autoReplayEnabled = enabled
+        debugPrint("Auto Replay:", enabled and "ON" or "OFF")
+    end,
+})
+
+local antiAfkModule = dungeonTab:Module({
+    Title = "Anti-AFK",
+    Description = "Attempt to prevent idle disconnects while the licensed Speedrun is running.",
+    Icon = "shield-check",
+    Keybind = false,
+    Default = ANTI_AFK_DEFAULT,
+    Callback = function(enabled)
+        antiAfkEnabled = enabled
+        debugPrint("Anti-AFK:", enabled and "ON" or "OFF")
+    end,
+})
+
+-- Future dungeons register their own modules here, without showing
+-- irrelevant controls from the Halloween farm.
+local dungeonModules = {
+    halloween = { speedrunModule, autoReplayModule, antiAfkModule },
+}
+
+local function updateDungeonModules()
+    for dungeonId, modules in pairs(dungeonModules) do
+        local show = (dungeonId == selectedDungeonId)
+        for _, module in ipairs(modules) do
+            module:SetVisible(show)
+        end
     end
 end
+
+onDungeonSelected = function(value)
+    -- OasisUI single-select returns the configured string Value.
+    -- This also handles clearing the selection or a table value defensively.
+    if type(value) == "table" then
+        value = value.Value or value.value or value[1]
+    end
+    if type(value) ~= "string" or not DUNGEONS[value] then
+        value = nil
+    end
+    if value == selectedDungeonId then
+        return
+    end
+
+    -- Switching or clearing a selected dungeon safely stops a running farm.
+    if running and onSpeedrunToggle then
+        onSpeedrunToggle(false)
+    end
+    selectedDungeonId = value
+    updateDungeonModules()
+
+    if selectedDungeonId == "halloween" then
+        selectorInfo:SetContent(
+            "Halloween Dungeon 2026 selected. Choose Speedrun, Auto Replay, and Anti-AFK below."
+        )
+        Window:SetSubtitle("Halloween Dungeon | Speedrun V5")
+        debugPrint("Dungeon selected:", "Halloween Dungeon")
+    else
+        selectorInfo:SetContent("Choose a dungeon to display its available farming functions.")
+        Window:SetSubtitle("Dungeon Speedrun V5")
+        debugPrint("Dungeon selection cleared")
+    end
+end
+
+-- On first launch, nothing is selected and no farming controls are visible.
+updateDungeonModules()
+onDungeonSelected(dungeonSelector:Get())
+
+-- Universal status and license page retained independently from the selected dungeon.
+local live = statusTab:Section({ Title = "Dungeon Statistics", Icon = "chart-no-axes-column" })
+local roomLabel = textProxy(live:Label({ Text = "Room", Value = "Room: - / 18" }))
+local waveLabel = textProxy(live:Label({ Text = "Wave", Value = "Wave: -" }))
+local targetLabel = textProxy(live:Label({ Text = "Target", Value = "Target: -" }))
+local healthLabel = textProxy(live:Label({ Text = "Target HP", Value = "HP: -" }))
+local killLabel = textProxy(live:Label({ Text = "Defeated", Value = "Enemies defeated: 0" }))
+local attackLabel = textProxy(live:Label({ Text = "Attacks", Value = "Attacks: 0" }))
+local statusLabel = textProxy(live:Label({ Text = "Status", Value = "Status: Ready" }))
+local licenseArea = statusTab:Section({ Title = "License", Icon = "key-round" })
+local licenseButton = textProxy(licenseArea:Label({ Text = "Remaining access", Value = "Not activated" }))
+
+local function setButton(enabled)
+    syncingSpeedrun = true
+    if speedrunModule:Get() ~= enabled then
+        speedrunModule:Set(enabled)
+    end
+    syncingSpeedrun = false
+end
+
+-- Stop all background dungeon tasks if OasisUI is unloaded.
+OasisUI:OnUnload(function()
+    running = false
+    sessionId = sessionId + 1
+    if gui.Parent then gui:Destroy() end
+    local oldAccess = playerGui:FindFirstChild("PolyLootAccessV4")
+    if oldAccess then oldAccess:Destroy() end
+end)
 
 local function stopMovement()
     local humanoid = getHumanoid()
@@ -361,73 +519,8 @@ manualLinkBox.Text = ""
 manualLinkBox.Visible = false
 manualLinkBox.Parent = accessFrame
 
-local licenseButton = Instance.new("TextButton")
-licenseButton.Name = "LicenseInfo"
-licenseButton.Size = UDim2.new(1, -30, 0, 25)
-licenseButton.Position = UDim2.fromOffset(15, 302)
-licenseButton.BackgroundTransparency = 1
-licenseButton.TextColor3 = Color3.fromRGB(155, 195, 235)
-licenseButton.Font = Enum.Font.Gotham
-licenseButton.TextSize = 12
-licenseButton.Text = "License: not activated"
-licenseButton.Parent = frame
-
--- Optional Auto Replay toggle in the main GUI.
-local autoReplayButton = Instance.new("TextButton")
-autoReplayButton.Name = "AutoReplayToggle"
-autoReplayButton.Size = UDim2.new(1, -30, 0, 32)
-autoReplayButton.Position = UDim2.fromOffset(15, 338)
-autoReplayButton.BackgroundColor3 = Color3.fromRGB(55, 58, 75)
-autoReplayButton.BorderSizePixel = 0
-autoReplayButton.TextColor3 = Color3.fromRGB(240, 240, 250)
-autoReplayButton.Font = Enum.Font.GothamBold
-autoReplayButton.TextSize = 13
-autoReplayButton.Parent = frame
-Instance.new("UICorner", autoReplayButton).CornerRadius = UDim.new(0, 8)
-
-local function updateAutoReplayButton()
-    autoReplayButton.Text = autoReplayEnabled
-        and "AUTO REPLAY: ON (uses 1 dungeon item)"
-        or "AUTO REPLAY: OFF (manual)"
-    autoReplayButton.BackgroundColor3 = autoReplayEnabled
-        and Color3.fromRGB(40, 110, 85)
-        or Color3.fromRGB(55, 58, 75)
-end
-
-updateAutoReplayButton()
-autoReplayButton.MouseButton1Click:Connect(function()
-    autoReplayEnabled = not autoReplayEnabled
-    updateAutoReplayButton()
-    debugPrint("Auto Replay:", autoReplayEnabled and "ON" or "OFF")
-end)
-
--- Optional Anti-AFK toggle in the main GUI (enabled by default).
-local antiAfkButton = Instance.new("TextButton")
-antiAfkButton.Name = "AntiAfkToggle"
-antiAfkButton.Size = UDim2.new(1, -30, 0, 32)
-antiAfkButton.Position = UDim2.fromOffset(15, 380)
-antiAfkButton.BorderSizePixel = 0
-antiAfkButton.TextColor3 = Color3.fromRGB(240, 240, 250)
-antiAfkButton.Font = Enum.Font.GothamBold
-antiAfkButton.TextSize = 13
-antiAfkButton.Parent = frame
-Instance.new("UICorner", antiAfkButton).CornerRadius = UDim.new(0, 8)
-
-local function updateAntiAfkButton()
-    antiAfkButton.Text = antiAfkEnabled and "ANTI-AFK: ON" or "ANTI-AFK: OFF"
-    antiAfkButton.BackgroundColor3 = antiAfkEnabled
-        and Color3.fromRGB(40, 110, 85)
-        or Color3.fromRGB(55, 58, 75)
-end
-
-updateAntiAfkButton()
-antiAfkButton.MouseButton1Click:Connect(function()
-    antiAfkEnabled = not antiAfkEnabled
-    updateAntiAfkButton()
-    debugPrint("Anti-AFK:", antiAfkEnabled and "ON" or "OFF")
-end)
-
--- Hauptoberflaeche vor erfolgreicher Key-Pruefung unsichtbar.
+-- The main window's license display and automation controls are in OasisUI.
+-- The existing 24-hour key gate above remains unchanged.
 frame.Visible = false
 
 local function secondsToText(seconds)
@@ -555,7 +648,7 @@ local function verifyAccessKey(key, automatic)
         saveKeyLocally(key)
         accessStatus.Text = "Key valid: " .. secondsToText(remaining) .. " remaining."
         accessStatus.TextColor3 = Color3.fromRGB(147, 224, 181)
-        licenseButton.Text = "License: " .. secondsToText(remaining) .. " (click)"
+        licenseButton.Text = "License: " .. secondsToText(remaining)
         frame.Visible = true
         accessGui.Enabled = false
         return
@@ -631,12 +724,16 @@ closeAccessButton.MouseButton1Click:Connect(function()
     end
 end)
 
-licenseButton.MouseButton1Click:Connect(function()
-    accessStatus.Text = accessGranted
-        and ("License: " .. secondsToText(accessDeadline - os.clock()) .. " remaining.")
-        or "A valid key is required."
-    accessGui.Enabled = true
-end)
+licenseArea:Button({
+    Title = "Open Key Manager",
+    Icon = "key-round",
+    Callback = function()
+        accessStatus.Text = accessGranted
+            and ("License: " .. secondsToText(accessDeadline - os.clock()) .. " remaining.")
+            or "A valid key is required."
+        accessGui.Enabled = true
+    end,
+})
 
 -- Automatisch gespeicherten Key pruefen (nicht blind vertrauen).
 task.spawn(function()
@@ -656,7 +753,7 @@ task.spawn(function()
             if remaining <= 0 then
                 stopForAccess("24-hour access expired. Get a new key.")
             else
-                licenseButton.Text = "License: " .. secondsToText(remaining) .. " (click)"
+                licenseButton.Text = "License: " .. secondsToText(remaining)
                 if os.clock() >= nextServerCheck and not accessBusy then
                     nextServerCheck = os.clock() + KEY_RECHECK_SECONDS
                     verifyAccessKey(accessKey, true)
@@ -1961,7 +2058,6 @@ local function startSpeedrun(id)
                 replayAttempted = false
                 replayAttemptAt = 0
                 statusLabel.Text = "Dungeon cleared - waiting for restart"
-                button.Text = "WAITING FOR RESTART"
                 debugPrint("Dungeon cleared; waiting for restart")
             end
             -- Collect any final boss drops before requesting another run.
@@ -2059,13 +2155,20 @@ end
 -- AN / AUS BUTTON
 
 -- ============================================
-button.MouseButton1Click:Connect(function()
-    if not accessGranted or os.clock() >= accessDeadline then
+onSpeedrunToggle = function(enabled)
+    if enabled and selectedDungeonId ~= "halloween" then
+        setButton(false)
+        statusLabel.Text = "Select Halloween Dungeon before starting"
+        return
+    end
+    if enabled and (not accessGranted or os.clock() >= accessDeadline) then
+        setButton(false)
         accessGui.Enabled = true
         accessStatus.Text = "Please verify a valid key."
         return
     end
-    running = not running
+    if running == enabled then return end
+    running = enabled
     sessionId = sessionId + 1
     if running then
         dungeonComplete = false
@@ -2085,5 +2188,6 @@ button.MouseButton1Click:Connect(function()
         stopMovement()
         clearTarget()
     end
-end)
-print("Poly Loot Dungeon Speedrun V5 Universal + 24h Key GUI loaded!")
+end
+
+print("Poly Loot Dungeon Speedrun V5 + OasisUI dungeon selector + 24h Key loaded!")
