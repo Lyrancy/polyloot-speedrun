@@ -1,6 +1,6 @@
--- POLY LOOT DUNGEON SPEEDRUN V5 + OASIS UI + 24H KEY
+-- POLY LOOT DUNGEON SPEEDRUN V5.5 + OASISUI + 24H KEY
 -- ============================================
--- POLY LOOT | DUNGEON SPEEDRUN V5 UNIVERSAL + ANTI-AFK
+-- POLY LOOT | DUNGEON SPEEDRUN V5.5 OASISUI + ANTI-AFK
 
 -- ============================================
 local Players = game:GetService("Players")
@@ -54,11 +54,22 @@ local MAX_PREDICTION = 0.8
 -- Anti-Stuck
 local NO_DAMAGE_TIMEOUT = 12
 local ENEMY_RETRY_DELAY = 5
--- Navigation
+-- Navigation | V5.3: direct-only crossings, bounded quick retries.
 local DOOR_TELEPORT_DISTANCE = 12
-local ROOM_CONFIRM_TIMEOUT = 6
-local ROOM_RETRY_DELAY = 1.5
-local ROOM_TRANSITION_DELAY = 1.5
+-- V5.4: the visible Room notification may arrive after the character crossed.
+-- Give the game a chance to report the room before forcing another teleport.
+local ROOM_CONFIRM_TIMEOUT = 3.4
+local ROOM_RETRY_DELAY = 0.35
+local ROOM_TRANSITION_DELAY = 0.4
+local ROOM_MAX_CROSS_ATTEMPTS = 3
+local ROOM_POSITION_CHECK_DELAY = 0.22
+-- V5.5: poll after the initial check so late rollbacks are caught promptly.
+local ROOM_POSITION_POLL_INTERVAL = 0.10
+local ROOM_ROLLBACK_CONFIRM_SAMPLES = 2
+local ROOM_RETRY_AFTER_ROLLBACK = 0.38
+local ROOM_POPUP_GRACE_SECONDS = 6.0
+local ROOM_CROSSED_SIDE_THRESHOLD = 5.0
+local ROOM_CLOSE_TO_TARGET_THRESHOLD = 8.0
 local AUTO_ENTER_FIRST_ROOM = true
 
 -- Auto Replay is opt-in because each successful restart costs one
@@ -105,6 +116,26 @@ local skippedEnemies = {}
 local usedDoors = {}
 local currentHighlight = nil
 local lastRoomAttempt = 0
+-- One loot inspection per room; keep direction stable across failed retries.
+local lootCheckedRoom = nil
+local approachRoom = nil
+local approachDoor = nil
+local approachDirection = nil
+-- A door can be physically crossed before the game's room notification arrives.
+-- Keep a short pending state so we don't teleport backwards on stale popup data.
+local pendingDoor = nil
+local pendingRoom = nil
+local pendingDirection = nil
+local pendingCrossedAt = 0
+local pendingDoorLogAt = 0
+
+local function clearPendingDoor()
+    pendingDoor = nil
+    pendingRoom = nil
+    pendingDirection = nil
+    pendingCrossedAt = 0
+    pendingDoorLogAt = 0
+end
 
 -- ============================================
 -- SPIELOBJEKTE
@@ -200,7 +231,7 @@ local OasisUI = loadstring(game:HttpGet(
 
 local Window = OasisUI:CreateWindow({
     Title = "POLY LOOT",
-    Subtitle = "Dungeon Speedrun V5",
+    Subtitle = "Dungeon Speedrun V5.2",
     Folder = "PolyLootSpeedrun",
     GuiName = "PolyLootOasisV5",
     Icon = "swords",
@@ -381,7 +412,7 @@ onDungeonSelected = function(value)
         debugPrint("Dungeon selected:", "Halloween Dungeon")
     else
         selectorInfo:SetContent("Choose a dungeon to display its available farming functions.")
-        Window:SetSubtitle("Dungeon Speedrun V5")
+        Window:SetSubtitle("Dungeon Speedrun V5.2")
         debugPrint("Dungeon selection cleared")
     end
 end
@@ -1050,7 +1081,15 @@ local function installSceneReplayListener()
 
     local ok, conn = pcall(function()
         return scene.OnClientEvent:Connect(function(action, data)
-            -- Only interpret events for a dungeon which is currently completed.
+            -- Diagnostic only: compare server gate timing with the delayed
+            -- room popup. Gate signals alone do NOT prove room entry.
+            if DEBUG_MODE and running and not waitingForRestart
+                and action == "gate" and type(data) == "table" then
+                debugPrint("[SCENE] In-run gate event:",
+                    "room", tostring(data.room),
+                    "open", tostring(data.open))
+            end
+            -- Only interpret replay events for a completed dungeon.
             if not running or not accessGranted or not
                 (waitingForRestart or isDungeonComplete()) then
                 return
@@ -1123,6 +1162,16 @@ local function processNotification(text)
             debugPrint("Neuer Dungeon: Raum 1 angekuendigt")
         end
         if newRoom ~= currentRoom then
+            -- This notification is the *displayed* room progress, not proof
+            -- of when the avatar first crossed the gate. Record the delay.
+            if pendingRoom and newRoom > pendingRoom then
+                debugPrint(
+                    "[DOOR] Room popup arrived:", pendingRoom, "->", newRoom,
+                    string.format("%.2fs after physical crossing",
+                        math.max(0, os.clock() - pendingCrossedAt))
+                )
+                clearPendingDoor()
+            end
             currentRoom = newRoom
             currentWave = 0
             totalWaves = tonumber(waves)
@@ -1596,87 +1645,237 @@ local function enterFirstRoom(id)
 end
 
 -- ============================================
--- TELEPORT DURCH OFFENE TÜR
-
+-- CROSS OPEN DOOR | V5.5 / CONTINUOUS ROLLBACK MONITOR
 -- ============================================
-
+-- The popup is not a reliable real-time position sensor. After crossing,
+-- continuously monitor the door side and wait for the popup as long as the
+-- character remains in the new room. Retry on confirmed rollback only.
+-- Bounded to 3 attempts per transition, with no new remote calls.
 local function teleportThroughDoor(id)
-    if not validSession(id)
-        or currentRoom <= 0
-        or currentRoom >= 18 then
+    if not validSession(id) or currentRoom <= 0 or currentRoom >= 18 then
         return false
     end
+
     local door = getOpenDoor()
-    local root = getRoot()
-    local character = getCharacter()
-    if not door or not root or not character then
+    if not door or not door:IsA("BasePart") or door.CanCollide then
         return false
     end
+
     local roomBefore = currentRoom
-    local horizontal = Vector3.new(
-        door.Position.X - root.Position.X,
-        0,
-        door.Position.Z - root.Position.Z
-    )
-    if horizontal.Magnitude < 0.1 then
-        return false
-    end
-    local direction = horizontal.Unit
-    local destination =
-        Vector3.new(
-            door.Position.X,
-            root.Position.Y,
-            door.Position.Z
-        ) + direction * DOOR_TELEPORT_DISTANCE
-    statusLabel.Text =
-        "Teleporting to room " .. (roomBefore + 1)
-    debugPrint(
-        "Teleport:",
-        roomBefore,
-        "->",
-        roomBefore + 1,
-        door:GetFullName()
-    )
-    if not validSession(id)
-        or door.CanCollide then
-        return false
-    end
--- Charakter durch die geöffnete Tür teleportieren
-character:PivotTo(
-    CFrame.lookAt(
-        destination,
-        destination + direction
-    )
-)
--- Kampf während des Raumwechsels pausieren
-transitionUntil = os.clock() + ROOM_TRANSITION_DELAY
-debugPrint(
-    "Raumwechsel-Sperre aktiviert:",
-    ROOM_TRANSITION_DELAY,
-    "Sekunden"
-)
--- Auf neue Raumankuendigung warten
-    local started = os.clock()
-    while validSession(id)
-        and os.clock() - started < ROOM_CONFIRM_TIMEOUT do
-        if isDungeonComplete() then
+    local initialRoot = getRoot()
+    if not initialRoot then return false end
+
+    if approachRoom ~= roomBefore or approachDoor ~= door
+        or not approachDirection then
+        local delta = Vector3.new(
+            door.Position.X - initialRoot.Position.X,
+            0,
+            door.Position.Z - initialRoot.Position.Z
+        )
+        if delta.Magnitude < 0.1 then
+            debugPrint("[DOOR] Cannot determine door direction")
             return false
         end
+        approachRoom = roomBefore
+        approachDoor = door
+        approachDirection = delta.Unit
+    end
+
+    local direction = approachDirection
+    local started = os.clock()
+    local attempts = 0
+    local lastAttemptAt = 0
+    local positionCheckAt = 0
+    local lastTarget = nil
+    local physicalCrossingSeen = false
+    local rollback = false
+    local rollbackSamples = 0
+    local firstPositionLogged = false
+
+    local function measurePosition()
+        local root = getRoot()
+        if not root or not door.Parent then return nil, nil end
+        local delta = Vector3.new(
+            root.Position.X - door.Position.X,
+            0,
+            root.Position.Z - door.Position.Z
+        )
+        local side = delta:Dot(direction)
+        local targetOffset = lastTarget
+            and horizontalDistance(root.Position, lastTarget) or nil
+        return side, targetOffset
+    end
+
+    local function directAttempt(reason)
+        if not validSession(id) or currentRoom ~= roomBefore
+            or isDungeonComplete() or not door.Parent or door.CanCollide then
+            return false
+        end
+        local character = getCharacter()
+        local root = getRoot()
+        if not character or not root then return false end
+        local target = Vector3.new(
+            door.Position.X, root.Position.Y, door.Position.Z
+        ) + direction * DOOR_TELEPORT_DISTANCE
+        attempts = attempts + 1
+        lastAttemptAt = os.clock()
+        positionCheckAt = lastAttemptAt + ROOM_POSITION_CHECK_DELAY
+        lastTarget = target
+        rollback = false
+        rollbackSamples = 0
+        firstPositionLogged = false
+        transitionUntil = os.clock() + ROOM_TRANSITION_DELAY
+        statusLabel.Text = "Crossing into room " .. (roomBefore + 1)
+        debugPrint(
+            "[DOOR] Direct attempt", attempts,
+            "room", roomBefore, "->", roomBefore + 1,
+            "trigger", reason,
+            "doorDistance", string.format("%.1f",
+                horizontalDistance(root.Position, door.Position))
+        )
+        character:PivotTo(CFrame.lookAt(target, target + direction))
+        return true
+    end
+
+    if not directAttempt("initial") then return false end
+
+    while validSession(id) and os.clock() - started < ROOM_CONFIRM_TIMEOUT do
+        if isDungeonComplete() then return false end
+
         if currentRoom > roomBefore then
             usedDoors[door] = true
             roomCleared = false
+            approachRoom = nil
+            approachDoor = nil
+            approachDirection = nil
+            clearPendingDoor()
             debugPrint(
-                "Raum erfolgreich betreten:",
-                currentRoom
+                "[DOOR] Room transition confirmed:",
+                roomBefore, "->", currentRoom,
+                string.format("%.2fs", os.clock() - started),
+                "attempts", attempts
             )
             return true
         end
-        task.wait(0.1)
+
+        local now = os.clock()
+        -- V5.5: continue sampling after the first 0.22-second position check.
+        -- In V5.4 we sampled once, so a later server snapback could remain
+        -- unnoticed until the full timeout or pending-popup grace handling.
+        if positionCheckAt > 0 and now >= positionCheckAt then
+            positionCheckAt = now + ROOM_POSITION_POLL_INTERVAL
+            local side, targetOffset = measurePosition()
+            if side then
+                local wasRollback = rollback
+                if side < -3 then
+                    rollbackSamples = rollbackSamples + 1
+                else
+                    rollbackSamples = 0
+                end
+                rollback = rollbackSamples >= ROOM_ROLLBACK_CONFIRM_SAMPLES
+
+                if side >= ROOM_CROSSED_SIDE_THRESHOLD
+                    and targetOffset
+                    and targetOffset <= ROOM_CLOSE_TO_TARGET_THRESHOLD then
+                    if not physicalCrossingSeen then
+                        physicalCrossingSeen = true
+                        pendingDoor = door
+                        pendingRoom = roomBefore
+                        pendingDirection = direction
+                        pendingCrossedAt = now
+                        pendingDoorLogAt = now
+                        debugPrint(
+                            "[DOOR] Behind door; monitoring position and popup:",
+                            roomBefore, "->", roomBefore + 1
+                        )
+                    end
+                end
+
+                if not firstPositionLogged or (rollback and not wasRollback) then
+                    debugPrint(
+                        "[DOOR] Position check:",
+                        "attempt", attempts,
+                        "side", string.format("%.1f", side),
+                        "targetOffset", string.format("%.1f", targetOffset or -1),
+                        "returnedToStartSide", tostring(rollback),
+                        "rollbackSamples", rollbackSamples
+                    )
+                    firstPositionLogged = true
+                end
+                if rollback and not wasRollback then
+                    debugPrint(
+                        "[DOOR] Late rollback detected; retrying without waiting for timeout",
+                        "room", roomBefore, "->", roomBefore + 1,
+                        "elapsed", string.format("%.2fs", now - started)
+                    )
+                end
+            end
+        end
+
+        -- Never repeat an already successful physical crossing simply because
+        -- the game's notification is late. Only retry when the avatar is
+        -- actually back on the starting side of the selected door.
+        if rollback and attempts < ROOM_MAX_CROSS_ATTEMPTS
+            and now - lastAttemptAt >= ROOM_RETRY_AFTER_ROLLBACK then
+            physicalCrossingSeen = false
+            clearPendingDoor()
+            if not directAttempt("measured rollback") then break end
+        end
+
+        task.wait(0.06)
     end
+
+    local side, targetOffset = measurePosition()
     debugPrint(
-        "Raumwechsel nicht bestaetigt:",
-        roomBefore
+        "[DOOR] Popup still pending after crossing:", roomBefore,
+        "attempts", attempts,
+        "side", side and string.format("%.1f", side) or "n/a",
+        "targetOffset", targetOffset
+            and string.format("%.1f", targetOffset) or "n/a"
     )
+    -- The next main-loop iteration observes pendingDoor first. It waits for
+    -- the popup, unless the avatar moves back to the original side.
+    return false
+end
+
+local function waitingForDelayedRoomPopup()
+    if not pendingDoor or pendingRoom ~= currentRoom
+        or not pendingDirection or not pendingDoor.Parent then
+        clearPendingDoor()
+        return false
+    end
+
+    local root = getRoot()
+    if not root then return false end
+
+    local offset = Vector3.new(
+        root.Position.X - pendingDoor.Position.X,
+        0,
+        root.Position.Z - pendingDoor.Position.Z
+    )
+    local side = offset:Dot(pendingDirection)
+
+    -- We are genuinely back in the previous room: allow recovery crossing.
+    if side < -3 then
+        debugPrint("[DOOR] Physical rollback confirmed; retry enabled", side)
+        clearPendingDoor()
+        return false
+    end
+
+    -- Pending notifications are given a bounded grace period so the script
+    -- cannot get stuck forever waiting for a UI popup that never appears.
+    if os.clock() - pendingCrossedAt < ROOM_POPUP_GRACE_SECONDS then
+        if os.clock() - pendingDoorLogAt >= 1.0 then
+            debugPrint("[DOOR] Waiting for room popup, still behind door:",
+                currentRoom, "side", string.format("%.1f", side))
+            pendingDoorLogAt = os.clock()
+        end
+        return true
+    end
+
+    debugPrint("[DOOR] Popup grace expired; allowing one recovery pass:",
+        currentRoom, "side", string.format("%.1f", side))
+    clearPendingDoor()
     return false
 end
 
@@ -1702,6 +1901,11 @@ local function resetDungeonRun(roomAlreadyDetected)
     skippedEnemies = {}
     usedDoors = {}
     lastRoomAttempt = 0
+    lootCheckedRoom = nil
+    approachRoom = nil
+    approachDoor = nil
+    approachDirection = nil
+    clearPendingDoor()
     transitionUntil = 0
     attackCount = 0
     defeatedCount = 0
@@ -2446,14 +2650,27 @@ local function startSpeedrun(id)
             local enemy = getNextEnemy()
             if enemy then
                 fightEnemy(enemy, id)
+            elseif waitingForDelayedRoomPopup() then
+                statusLabel.Text = "Waiting for room confirmation..."
+                task.wait(0.12)
             elseif currentRoom > 0 and currentRoom < 18 and getOpenDoor() then
             if os.clock() - lastRoomAttempt
                 >= ROOM_RETRY_DELAY then
                 lastRoomAttempt = os.clock()
--- Zuerst alle erreichbaren Drops einsammeln
-                collectDroppedItems(id)
--- Danach erst zum nächsten Raum
-                if validSession(id) then
+                local requestedRoom = currentRoom
+-- Scan loot once per room, not again after an unconfirmed door.
+                if lootCheckedRoom ~= currentRoom then
+                    local scannedRoom = currentRoom
+                    local scanned = collectDroppedItems(id)
+                    if scanned and validSession(id) and currentRoom == scannedRoom then
+                        lootCheckedRoom = scannedRoom
+                    end
+                else
+                    debugPrint("Loot already checked for room", currentRoom,
+                        "- skipping repeated scan")
+                end
+-- Then try crossing (never if the room changed while scanning).
+                if validSession(id) and currentRoom == requestedRoom then
                     teleportThroughDoor(id)
                 end
             end
@@ -2501,11 +2718,17 @@ onSpeedrunToggle = function(enabled)
         skippedEnemies = {}
         usedDoors = {}
         lastRoomAttempt = 0
+        lootCheckedRoom = nil
+        approachRoom = nil
+        approachDoor = nil
+        approachDirection = nil
+        clearPendingDoor()
         setButton(true)
         statusLabel.Text = "Speedrun started"
         local id = sessionId
         task.spawn(startSpeedrun, id)
     else
+        clearPendingDoor()
         setButton(false)
         statusLabel.Text = "Speedrun stopped"
         stopMovement()
@@ -2513,4 +2736,4 @@ onSpeedrunToggle = function(enabled)
     end
 end
 
-print("Poly Loot Dungeon Speedrun V5 PATCHED + OasisUI dungeon selector + 24h Key loaded!")
+print("Poly Loot Dungeon Speedrun V5.5 OasisUI with continuous rollback monitoring loaded!")
