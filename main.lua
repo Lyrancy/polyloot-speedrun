@@ -231,7 +231,7 @@ local OasisUI = loadstring(game:HttpGet(
 
 local Window = OasisUI:CreateWindow({
     Title = "POLY LOOT",
-    Subtitle = "Dungeon Speedrun V5.2",
+    Subtitle = "Dungeon Speedrun V5.5",
     Folder = "PolyLootSpeedrun",
     GuiName = "PolyLootOasisV5",
     Icon = "swords",
@@ -408,11 +408,11 @@ onDungeonSelected = function(value)
         selectorInfo:SetContent(
             "Halloween Dungeon 2026 selected. Choose Speedrun, Auto Replay, and Anti-AFK below."
         )
-        Window:SetSubtitle("Halloween Dungeon | Speedrun V5")
+        Window:SetSubtitle("Halloween Dungeon | Speedrun V5.5")
         debugPrint("Dungeon selected:", "Halloween Dungeon")
     else
         selectorInfo:SetContent("Choose a dungeon to display its available farming functions.")
-        Window:SetSubtitle("Dungeon Speedrun V5.2")
+        Window:SetSubtitle("Dungeon Speedrun V5.5")
         debugPrint("Dungeon selection cleared")
     end
 end
