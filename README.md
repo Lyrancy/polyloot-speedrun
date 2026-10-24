@@ -1,8 +1,8 @@
-# POLY LOOT | DUNGEON SPEEDRUN V4
+# POLY LOOT | DUNGEON SPEEDRUN V5
 
 **Automated Halloween Dungeon Farming with 24-Hour Key Access**
 
-Poly Loot Dungeon Speedrun V4 is designed to make farming the Halloween Dungeon 2026 faster and easier by automating combat, enemy targeting, room navigation, and loot collection.
+Poly Loot Dungeon Speedrun V5 is designed to make farming the Halloween Dungeon 2026 faster and easier by automating combat, enemy targeting, room navigation, and loot collection.
 
 ## Features
 
