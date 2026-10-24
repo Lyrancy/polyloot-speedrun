@@ -14,6 +14,11 @@ local playerGui = player:WaitForChild("PlayerGui")
 local GET_KEY_URL = "https://direct-link.net/6460787/oJsS6xwt1UrJ"
 local KEY_VERIFY_URL = "https://polyloot-key-api.lyrabo6.workers.dev/api/verify"
 local KEY_RECHECK_SECONDS = 120
+-- A failed network recheck must not invalidate a server-approved 24h key.
+-- Retry sooner, but NEVER extend the local/server license expiry.
+local KEY_RECHECK_RETRY_SECONDS = 20
+-- An unreachable license server is tolerated briefly, not indefinitely.
+local KEY_RECHECK_GRACE_SECONDS = 600
 local SAVE_KEY_LOCALLY = true 
 local KEY_CACHE_FILE = "PolyLoot_24h_AccessKey.txt"
 
@@ -22,6 +27,8 @@ local accessKey = nil
 local accessDeadline = 0
 local nextServerCheck = 0
 local accessBusy = false
+local consecutiveRecheckFailures = 0
+local lastSuccessfulServerCheck = 0
 
 
 -- ============================================
@@ -60,7 +67,7 @@ local AUTO_REPLAY_DEFAULT = false
 -- Anti-AFK is enabled by default, but only sends activity while the
 -- licensed Speedrun is running. It can be toggled independently in the GUI.
 local ANTI_AFK_DEFAULT = true
-local REPLAY_CONFIRM_TIMEOUT = 9
+local REPLAY_CONFIRM_TIMEOUT = 15
 local transitionUntil = 0
 local DEBUG_MODE = true
 
@@ -160,7 +167,7 @@ end
 
 local function debugPrint(...)
     if DEBUG_MODE then
-        print("[DUNGEON V4]", ...)
+        print("[DUNGEON V5]", ...)
     end
 end
 
@@ -584,11 +591,18 @@ local function requestVerification(key)
         return false, nil, "Unexpected HTTP response."
     end
     local raw = reply.Body or reply.body
+    local httpStatus = tonumber(reply.StatusCode or reply.status_code or reply.Status)
     local decodedOk, data = pcall(function()
         return HttpService:JSONDecode(raw or "")
     end)
     if not decodedOk or type(data) ~= "table" then
-        return false, nil, "Server returned invalid JSON."
+        return false, nil,
+            "License HTTP response invalid (status " .. tostring(httpStatus or "unknown") .. ")."
+    end
+    -- Explicit server denial is handled by verifyAccessKey(), including expiry.
+    -- A gateway error that happens to have JSON must still count as retryable.
+    if httpStatus and (httpStatus == 429 or httpStatus >= 500) then
+        return false, nil, "License API temporarily unavailable (HTTP " .. httpStatus .. ")."
     end
     return true, data, nil
 end
@@ -597,6 +611,8 @@ local function stopForAccess(reason)
     accessGranted = false
     accessKey = nil
     accessDeadline = 0
+    lastSuccessfulServerCheck = 0
+    consecutiveRecheckFailures = 0
     running = false
     sessionId = sessionId + 1
     setButton(false)
@@ -631,19 +647,43 @@ local function verifyAccessKey(key, automatic)
 
     if not transportOk then
         if automatic and accessGranted then
-            stopForAccess("Unable to check license. Verify again.")
+            -- Do not revoke a still-valid license because Solara/HTTP briefly failed.
+            consecutiveRecheckFailures = consecutiveRecheckFailures + 1
+            if lastSuccessfulServerCheck > 0 and
+                os.clock() - lastSuccessfulServerCheck >= KEY_RECHECK_GRACE_SECONDS then
+                stopForAccess("License server unreachable for 10 minutes. Verify again.")
+                return
+            end
+            nextServerCheck = os.clock() + KEY_RECHECK_RETRY_SECONDS
+            debugPrint("License network recheck failed; retry in",
+                KEY_RECHECK_RETRY_SECONDS, "seconds; failures:",
+                consecutiveRecheckFailures, "reason:", transportError or "unknown")
         else
             accessStatus.Text = transportError or "Server unavailable."
+            accessStatus.TextColor3 = Color3.fromRGB(255, 174, 141)
         end
         return
     end
 
     local remaining = tonumber(data.secondsRemaining)
     if data.valid == true and remaining and remaining > 0 then
+        local serverBasedDeadline = os.clock() + remaining
+        -- An automatic renewal is a recheck, NOT a new 24-hour activation.
+        -- Keep the earlier known expiry instead of accidentally extending it.
+        if automatic and accessGranted and accessDeadline > 0 then
+            accessDeadline = math.min(accessDeadline, serverBasedDeadline)
+        else
+            accessDeadline = serverBasedDeadline
+        end
         accessGranted = true
         accessKey = key
-        accessDeadline = os.clock() + remaining
+        consecutiveRecheckFailures = 0
+        lastSuccessfulServerCheck = os.clock()
         nextServerCheck = os.clock() + KEY_RECHECK_SECONDS
+        if automatic then
+            debugPrint("License recheck OK; remaining minutes:",
+                math.floor(remaining / 60))
+        end
         keyInput.Text = key
         saveKeyLocally(key)
         accessStatus.Text = "Key valid: " .. secondsToText(remaining) .. " remaining."
@@ -662,7 +702,29 @@ local function verifyAccessKey(key, automatic)
         database_unavailable = "Key server temporarily unavailable.",
     }
     local message = messages[reason] or ("Key rejected: " .. reason)
+    -- Retry only transient/unexpected server errors. Explicit revocation or
+    -- expiry still stops immediately. The original local deadline always applies.
+    local transientReasons = {
+        database_unavailable = true,
+        server_unavailable = true,
+        internal_error = true,
+        rate_limited = true,
+    }
+    if automatic and accessGranted and
+       (transientReasons[reason] or data.valid == nil or
+        (data.valid == true and (not remaining or remaining <= 0))) then
+        consecutiveRecheckFailures = consecutiveRecheckFailures + 1
+        if lastSuccessfulServerCheck > 0 and
+            os.clock() - lastSuccessfulServerCheck >= KEY_RECHECK_GRACE_SECONDS then
+            stopForAccess("License server verification unavailable for 10 minutes. Verify again.")
+            return
+        end
+        nextServerCheck = os.clock() + KEY_RECHECK_RETRY_SECONDS
+        debugPrint("License response not conclusive; retry later:", reason)
+        return
+    end
     if automatic and accessGranted then
+        debugPrint("Server rejected license:", reason)
         stopForAccess(message)
     else
         accessStatus.Text = message
@@ -948,6 +1010,99 @@ local function isDungeonComplete()
         and result.Visible
         and resultTitle.Text == "Dungeon Cleared!"
 end
+
+-- ============================================
+-- HALLOWEEN SCENE REPLAY CONFIRMATION
+-- ============================================
+-- Scene is SERVER -> CLIENT. It confirms a restart but cannot start one.
+-- Observed manual replay sequence: exit {reason="again"}, arrive, gate.
+-- No __namecall hooks, no RemoteEvent:FireServer calls.
+local SCENE_RESTART_WAIT_SECONDS = 45
+local sceneReplay = {
+    exit = false,
+    arrive = false,
+    gate = false,
+    otherExit = false,
+    exitAt = 0,
+    arriveAt = 0,
+}
+
+local function clearSceneReplay()
+    sceneReplay.exit = false
+    sceneReplay.arrive = false
+    sceneReplay.gate = false
+    sceneReplay.otherExit = false
+    sceneReplay.exitAt = 0
+    sceneReplay.arriveAt = 0
+end
+
+local sceneEventsAvailable = false
+local function installSceneReplayListener()
+    local replicated = game:GetService("ReplicatedStorage")
+    local engine = replicated:FindFirstChild("HalloweenDungeon_Engine")
+    local remotes = engine and engine:FindFirstChild("Remotes")
+    local scene = remotes and remotes:FindFirstChild("Scene")
+
+    if not scene or not scene:IsA("RemoteEvent") then
+        debugPrint("[SCENE] Scene RemoteEvent not available; legacy replay detection")
+        return false
+    end
+
+    local ok, conn = pcall(function()
+        return scene.OnClientEvent:Connect(function(action, data)
+            -- Only interpret events for a dungeon which is currently completed.
+            if not running or not accessGranted or not
+                (waitingForRestart or isDungeonComplete()) then
+                return
+            end
+            if type(action) ~= "string" then return end
+            if type(data) ~= "table" then data = {} end
+
+            if action == "exit" then
+                local reason = tostring(data.reason or "")
+                if reason == "again" then
+                    if not sceneReplay.exit then
+                        sceneReplay.exit = true
+                        sceneReplay.exitAt = os.clock()
+                        debugPrint("[SCENE] exit(reason=again): restart accepted")
+                        statusLabel.Text = "Restart accepted - loading dungeon..."
+                    end
+                else
+                    sceneReplay.otherExit = true
+                    debugPrint("[SCENE] exit(reason=" .. reason .. "): not a replay")
+                end
+            elseif action == "arrive" and sceneReplay.exit then
+                local dungeonName = tostring(data.name or "")
+                if dungeonName == "" or dungeonName == "Halloween Dungeon 2026" then
+                    sceneReplay.arrive = true
+                    sceneReplay.arriveAt = os.clock()
+                    debugPrint("[SCENE] arrive: new dungeon loaded")
+                    statusLabel.Text = "New dungeon loaded - waiting for gate..."
+                end
+            elseif action == "gate" and sceneReplay.arrive then
+                if tonumber(data.room) == 1 and data.open == true then
+                    sceneReplay.gate = true
+                    debugPrint("[SCENE] gate(room=1, open=true): ready to continue")
+                    statusLabel.Text = "Dungeon ready - resuming speedrun"
+                end
+            end
+        end)
+    end)
+
+    if not ok or not conn then
+        debugPrint("[SCENE] Failed to connect; legacy replay detection")
+        return false
+    end
+
+    -- Prevent accumulating listeners when the script GUI is destroyed.
+    gui.Destroying:Connect(function()
+        pcall(function() conn:Disconnect() end)
+    end)
+    debugPrint("[SCENE] Listener enabled: exit -> arrive -> gate")
+    return true
+end
+
+sceneEventsAvailable = installSceneReplayListener()
 
 -- ============================================
 -- RAUM UND WELLEN
@@ -1543,6 +1698,7 @@ local function resetDungeonRun(roomAlreadyDetected)
     restartRoomObserved = false
     replayAttempted = false
     replayAttemptAt = 0
+    clearSceneReplay()
     skippedEnemies = {}
     usedDoors = {}
     lastRoomAttempt = 0
@@ -1801,14 +1957,30 @@ local function getReplayButton()
     return again, nil
 end
 
+-- ============================================
+-- PRECISE REPLAY CLICK (Solara/desktop executors)
+-- ============================================
+-- Roblox AbsolutePosition is relative to CoreUISafeInsets. Native mouse
+-- coordinates and UserInputService:GetMouseLocation() use screen pixels.
+-- Add the top-left inset exactly once regardless of IgnoreGuiInset.
+local UserInputService = game:GetService("UserInputService")
+local GuiService = game:GetService("GuiService")
+
 local function replayButtonCenter(again)
     local pos = again.AbsolutePosition
     local size = again.AbsoluteSize
     if size.X <= 0 or size.Y <= 0 then
         return nil, nil, "Run again button is not on-screen"
     end
-    local x = math.floor(pos.X + size.X / 2)
-    local y = math.floor(pos.Y + size.Y / 2)
+    local center = pos + size * 0.5
+    local ok, inset = pcall(function()
+        return GuiService:GetGuiInset()
+    end)
+    if not ok or typeof(inset) ~= "Vector2" then
+        inset = Vector2.new(0, 0)
+    end
+    local x = math.floor(center.X + inset.X + 0.5)
+    local y = math.floor(center.Y + inset.Y + 0.5)
     local camera = workspace.CurrentCamera
     if camera then
         local viewport = camera.ViewportSize
@@ -1819,8 +1991,80 @@ local function replayButtonCenter(again)
     return x, y, nil
 end
 
--- A real mouse click is preferable when possible: it follows the game's
--- normal input path. Our own GUI is hidden briefly to avoid blocking it.
+local function readActualMouse()
+    local ok, p = pcall(function()
+        return UserInputService:GetMouseLocation()
+    end)
+    if ok and typeof(p) == "Vector2" then
+        return p
+    end
+    return nil
+end
+
+-- Move first, measure where the cursor actually landed, then correct any
+-- window/inset offset BEFORE pressing. No probing clicks are performed.
+local function moveToReplayCenter(x, y, again)
+    local target = Vector2.new(x, y)
+    local size = again.AbsoluteSize
+    local toleranceX = math.max(5, math.min(16, size.X * 0.14))
+    local toleranceY = math.max(5, math.min(16, size.Y * 0.14))
+
+    mousemoveabs(x, y)
+    task.wait(0.12)
+
+    local last = readActualMouse()
+    if not last then
+        -- On executors where location cannot be read, preserve the normal
+        -- native mouse behavior, but report that alignment was unverified.
+        return true, "Mouse position unavailable; alignment unverified"
+    end
+
+    for step = 1, 3 do
+        local dx = target.X - last.X
+        local dy = target.Y - last.Y
+        if math.abs(dx) <= toleranceX and math.abs(dy) <= toleranceY then
+            return true, string.format(
+                "Aligned at (%d,%d), target (%d,%d), correction steps %d",
+                math.floor(last.X + 0.5), math.floor(last.Y + 0.5),
+                x, y, step - 1
+            )
+        end
+
+        if step == 3 then break end
+
+        debugPrint(string.format(
+            "Replay mouse offset: dx=%.1f dy=%.1f; adjusting",
+            dx, dy
+        ))
+        local moved = pcall(function()
+            if type(mousemoverel) == "function" then
+                mousemoverel(math.floor(dx + (dx >= 0 and 0.5 or -0.5)),
+                             math.floor(dy + (dy >= 0 and 0.5 or -0.5)))
+            else
+                -- Fallback if the executor only provides absolute movement.
+                mousemoveabs(math.floor(x + dx + 0.5),
+                             math.floor(y + dy + 0.5))
+            end
+        end)
+        if not moved then
+            return false, "Cursor correction API failed"
+        end
+        task.wait(0.12)
+        local updated = readActualMouse()
+        if not updated then
+            return false, "Cursor location became unavailable"
+        end
+        last = updated
+    end
+
+    return false, string.format(
+        "Cursor missed button center: target (%d,%d), actual (%d,%d)",
+        x, y, math.floor(last.X + 0.5), math.floor(last.Y + 0.5)
+    )
+end
+
+-- A single verified native press-and-release. Never spam clicks or retry
+-- after input was dispatched, because each successful restart costs an item.
 local function tryNativeMouseReplay(id, again)
     if not canUseNativeMouse() then
         return false, "Native mouse API not available"
@@ -1828,53 +2072,57 @@ local function tryNativeMouseReplay(id, again)
     if not getNativeMouseFocus() then
         return false, "Roblox is not the focused window"
     end
-    local x, y, positionError = replayButtonCenter(again)
-    if not x then
-        return false, positionError
-    end
 
-    local alreadyPressed = false
-    local inputStarted = false
     local wasVisible = frame.Visible
+    local pressed = false
+    local inputStarted = false
+    local movedDetails = "not attempted"
     local ok, err = pcall(function()
-        -- Prevent the Speedrun GUI from covering the result's button.
         frame.Visible = false
         task.wait(0.12)
-        if not validSession(id) or not isDungeonComplete() or not again.Visible then
+        if not validSession(id) or not isDungeonComplete()
+            or not again.Visible or not again.Interactable then
             error("Result screen changed before clicking")
         end
-        mousemoveabs(x, y)
-        task.wait(0.12)
-        if not validSession(id) or not isDungeonComplete() then
-            error("Result screen disappeared before clicking")
+
+        -- Recalculate AFTER hiding the overlay, in case the GUI moved.
+        local x, y, locationError = replayButtonCenter(again)
+        if not x then error(locationError) end
+        local aligned, details = moveToReplayCenter(x, y, again)
+        movedDetails = details
+        debugPrint("Replay cursor:", details)
+        if not aligned then error(details) end
+
+        if not validSession(id) or not isDungeonComplete()
+            or not getNativeMouseFocus() then
+            error("Replay stopped: result closed or window lost focus")
         end
-        if type(mouse1press) == "function" and type(mouse1release) == "function" then
+
+        if type(mouse1press) == "function" and
+            type(mouse1release) == "function" then
             mouse1press()
             inputStarted = true
-            alreadyPressed = true
-            task.wait(0.075)
+            pressed = true
+            task.wait(0.11)
             mouse1release()
-            alreadyPressed = false
+            pressed = false
         else
-            -- mouse1click is supported by some executors without press/release.
             inputStarted = true
             mouse1click()
         end
         task.wait(0.15)
     end)
-    if alreadyPressed then
-        pcall(mouse1release)
-    end
+
+    if pressed then pcall(mouse1release) end
     frame.Visible = wasVisible and gui.Parent ~= nil
+
     if not ok then
-        -- A partially delivered mouse press is uncertain. Do not try a second
-        -- method automatically; it could trigger another paid dungeon run.
         if inputStarted then
-            return true, "Mouse input may have been sent: " .. tostring(err)
+            return true, "Mouse input possibly sent: " .. tostring(err)
         end
-        return false, "Native mouse failed: " .. tostring(err)
+        return false, "Mouse alignment/press failed: " .. tostring(err)
     end
-    return true, string.format("Native mouse click at %d, %d", x, y)
+    return true, "Single native click sent; " .. movedDetails
 end
 
 -- Direct signal activation for executors supporting firesignal.
@@ -1897,7 +2145,17 @@ local function tryFireSignalReplay(_, again)
     if type(firesignal) ~= "function" then
         return false, "firesignal API not available"
     end
-    local signal, eventName = chooseReplaySignal(again)
+    local signal, eventName, listeners = chooseReplaySignal(again)
+    if type(getconnections) == "function" and listeners == nil then
+        -- If introspection works and reports no handlers for either event,
+        -- use a real mouse action instead of treating an empty signal as success.
+        local aOk, aList = pcall(getconnections, again.Activated)
+        local mOk, mList = pcall(getconnections, again.MouseButton1Click)
+        if aOk and mOk and type(aList) == "table" and type(mList) == "table"
+            and #aList == 0 and #mList == 0 then
+            return false, "No accessible replay button listeners"
+        end
+    end
     local ok, err = pcall(function()
         if eventName == "Activated" then
             firesignal(signal, nil, 0)
@@ -1989,10 +2247,12 @@ end
 
 local function replayMethodOrder()
     -- Name-based preference is only a hint; functionality is checked at call.
-    -- Solara: native cursor. Potassium: native cursor or signal fallback.
+    -- Solara: native cursor. Potassium: fire signal first, then native cursor.
     -- Unknown executor: detect and use whichever API is available.
     if executorNameLower:find("potassium", 1, true) then
-        return { "native", "signal", "connections", "virtual" }
+        -- Prefer the previously used Potassium signal API. The generic native
+        -- mouse path can report input dispatched even when it missed the GUI.
+        return { "signal", "native", "connections", "virtual" }
     elseif executorNameLower:find("solara", 1, true) then
         return { "native", "virtual", "signal", "connections" }
     end
@@ -2038,10 +2298,13 @@ local function attemptAutoReplay(id)
         end
         local success, sent, reason = pcall(replayMethods[method], id, again)
         if success and sent then
-            debugPrint("Auto Replay method:", method, reason)
+            debugPrint("Auto Replay input dispatched by:", method, reason,
+                "(not yet confirmed by dungeon)")
             return true, method .. ": " .. tostring(reason)
         end
-        table.insert(failures, method .. "=" .. tostring(success and reason or sent))
+        local failure = tostring(success and reason or sent)
+        debugPrint("Auto Replay method skipped/failed:", method, failure)
+        table.insert(failures, method .. "=" .. failure)
     end
     return false, "No usable method: " .. table.concat(failures, "; ")
 end
@@ -2057,6 +2320,7 @@ local function startSpeedrun(id)
                 clearTarget()
                 replayAttempted = false
                 replayAttemptAt = 0
+                -- Scene exit might already have arrived; do not clear it here.
                 statusLabel.Text = "Dungeon cleared - waiting for restart"
                 debugPrint("Dungeon cleared; waiting for restart")
             end
@@ -2065,41 +2329,99 @@ local function startSpeedrun(id)
                 finalLootHandled = true
                 collectDroppedItems(id)
             end
-            -- Start replay automatically only if the user enabled it.
-            -- Try at most ONCE per endscreen, even if the server rejects it.
-            while validSession(id) and isDungeonComplete() do
-                if autoReplayEnabled and not replayAttempted then
+            -- A Scene event confirms a restart. It never triggers one.
+            -- Dispatch at most ONE input attempt; manual Run again stays available.
+            local endscreenHiddenAt = nil
+            local replayReady = false
+            while validSession(id) do
+                local completeScreenVisible = isDungeonComplete()
+                local now = os.clock()
+
+                if sceneEventsAvailable and sceneReplay.otherExit then
+                    statusLabel.Text = "Dungeon exited without replay - stopped"
+                    debugPrint("[SCENE] Left dungeon without Run again; stopping")
+                    running = false
+                    sessionId = sessionId + 1
+                    setButton(false)
+                    break
+                end
+
+                if sceneEventsAvailable and sceneReplay.gate
+                    and not completeScreenVisible then
+                    replayReady = true
+                    break
+                end
+
+                if not completeScreenVisible then
+                    if not sceneEventsAvailable then
+                        -- If the Scene listener cannot be installed, retain
+                        -- the old endscreen-based fallback as a last resort.
+                        task.wait(1)
+                        replayReady = not isDungeonComplete()
+                        break
+                    end
+                    endscreenHiddenAt = endscreenHiddenAt or now
+                else
+                    endscreenHiddenAt = nil
+                end
+
+                if completeScreenVisible and autoReplayEnabled
+                    and not replayAttempted and not sceneReplay.exit then
                     replayAttempted = true
                     replayAttemptAt = os.clock()
                     local sent, reason = attemptAutoReplay(id)
                     debugPrint("Auto Replay attempt:", sent, reason)
                     if sent then
-                        statusLabel.Text = "Auto Replay sent - checking restart..."
+                        statusLabel.Text = "Replay input sent - awaiting Scene confirmation"
                     else
                         statusLabel.Text = "Auto Replay failed - click Run again"
                     end
                 end
+
+                -- Never automatically click again merely because Scene is slow.
                 if replayAttempted and replayAttemptAt > 0
-                    and os.clock() - replayAttemptAt >= REPLAY_CONFIRM_TIMEOUT then
+                    and not sceneReplay.exit
+                    and now - replayAttemptAt >= REPLAY_CONFIRM_TIMEOUT then
                     statusLabel.Text = "Replay not confirmed - click Run again"
-                    -- Disable repeated timeout messages, not the manual option.
                     replayAttemptAt = 0
                 end
+
+                if sceneEventsAvailable and sceneReplay.exit
+                    and not sceneReplay.gate
+                    and now - sceneReplay.exitAt >= SCENE_RESTART_WAIT_SECONDS then
+                    statusLabel.Text = "Restart received but gate not ready - stopped"
+                    debugPrint("[SCENE] Timed out waiting for arrive/gate")
+                    running = false
+                    sessionId = sessionId + 1
+                    setButton(false)
+                    break
+                end
+
+                if sceneEventsAvailable and endscreenHiddenAt
+                    and not sceneReplay.gate
+                    and now - endscreenHiddenAt >= SCENE_RESTART_WAIT_SECONDS then
+                    statusLabel.Text = "Restart unconfirmed by Scene - stopped"
+                    debugPrint("[SCENE] Endscreen vanished without confirmed gate")
+                    running = false
+                    sessionId = sessionId + 1
+                    setButton(false)
+                    break
+                end
+
                 task.wait(0.2)
             end
             if not validSession(id) then break end
-            -- Der neue Run startet im StartingRoom. Raum 1 wird erst
-            -- nach dem automatischen Eingangsteleport angekuendigt.
-            -- Deshalb darf hier NICHT auf Raum 1 gewartet werden.
-            task.wait(1)
-            if not validSession(id) then break end
-            if isDungeonComplete() then continue end
+            if not replayReady then
+                statusLabel.Text = "Replay was not confirmed"
+                break
+            end
 
-            -- Wieder in Startposition: Die naechste Iteration ruft
-            -- enterFirstRoom(id) auf, weil currentRoom = 0 ist.
-            resetDungeonRun(false)
+            -- New dungeon confirmed by the server: exit -> arrive -> gate.
+            -- Room 1 may already be reported by a notification.
+            local roomAlreadyDetected = restartRoomObserved and currentRoom == 1
+            resetDungeonRun(roomAlreadyDetected)
             setButton(true)
-            debugPrint("Endscreen geschlossen; beginne neuen Dungeon-Eintritt")
+            debugPrint("[SCENE] New dungeon confirmed; resuming")
             continue
         end
         if dismissLootPopup() then
@@ -2175,6 +2497,7 @@ onSpeedrunToggle = function(enabled)
         waitingForRestart = false
         replayAttempted = false
         replayAttemptAt = 0
+        clearSceneReplay()
         skippedEnemies = {}
         usedDoors = {}
         lastRoomAttempt = 0
@@ -2190,4 +2513,4 @@ onSpeedrunToggle = function(enabled)
     end
 end
 
-print("Poly Loot Dungeon Speedrun V5 + OasisUI dungeon selector + 24h Key loaded!")
+print("Poly Loot Dungeon Speedrun V5 PATCHED + OasisUI dungeon selector + 24h Key loaded!")
