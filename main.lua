@@ -1,7 +1,9 @@
+-- POLY LOOT V6.0 | OASISUI | DUNGEON + MAIN WORLD + AUTO SELL
+-- Release version: V6.0 | Based on V5.10.6 (no gameplay logic changes)
 -- V5.10.4: World Boss UI simplified; boss combat and automation logic unchanged.
 -- V5.10.2: Restore classic Single Enemy Farm distances/teleport logic from V5.9.6.
 -- No TweenService or teleport/activation diagnostics. Auto Sell separate tab preserved.
--- POLY LOOT V5.9.3 | OASISUI | 24H KEY
+-- POLY LOOT V6.0 | OASISUI | 24H KEY
 -- ============================================
 -- POLY LOOT | DUNGEON SPEEDRUN V5.5 OASISUI + ANTI-AFK
 
@@ -256,7 +258,7 @@ local OasisUI = loadstring(game:HttpGet(
 
 local Window = OasisUI:CreateWindow({
     Title = "POLY LOOT",
-    Subtitle = "Dungeon + World Boss V5.10.4",
+    Subtitle = "V6.0 | Dungeon + Main World + Auto Sell",
     Folder = "PolyLootSpeedrun",
     GuiName = "PolyLootOasisV5",
     Icon = "swords",
@@ -1124,11 +1126,11 @@ onDungeonSelected = function(value)
         selectorInfo:SetContent(
             "Halloween Dungeon 2026 selected. Choose Speedrun, Auto Replay, and Anti-AFK below."
         )
-        Window:SetSubtitle("Halloween Dungeon | Dungeon + Single Enemy V5.9.0")
+        Window:SetSubtitle("V6.0 | Halloween Dungeon")
         debugPrint("Dungeon selected:", "Halloween Dungeon")
     else
         selectorInfo:SetContent("Choose a dungeon to display its available farming functions.")
-        Window:SetSubtitle("Dungeon + Single Enemy Farm V5.9.0")
+        Window:SetSubtitle("V6.0 | Dungeon + Main World + Auto Sell")
         debugPrint("Dungeon selection cleared")
     end
 end
@@ -1138,6 +1140,8 @@ updateDungeonModules()
 onDungeonSelected(dungeonSelector:Get())
 
 -- Universal status and license page retained independently from the selected dungeon.
+local versionSection = statusTab:Section({ Title = "Script Version", Icon = "info" })
+versionSection:Label({ Text = "Version", Value = "Poly Loot V6.0" })
 local live = statusTab:Section({ Title = "Dungeon Statistics", Icon = "chart-no-axes-column" })
 local roomLabel = textProxy(live:Label({ Text = "Room", Value = "Room: - / 18" }))
 local waveLabel = textProxy(live:Label({ Text = "Wave", Value = "Wave: -" }))
@@ -4606,4 +4610,4 @@ onSpeedrunToggle = function(enabled)
     end
 end
 
-print("Poly Loot V5.9.0 OasisUI | Single Enemy + selected-boss sign respawn timers loaded!")
+print("Poly Loot V6.0 OasisUI | Dungeon + Main World + Auto Sell loaded!")
